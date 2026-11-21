@@ -66,12 +66,15 @@ import random  # noqa: F401  (seeded per match, so a seeded match replays exactl
 #                                call-off); bucket = effective stack in BB at hand start
 #     pf_jam[:bucket]            same, but only all-ins that raised (shoves)
 #
-#   Facing my postflop bets (chance: opp acts while owing chips to my bet/raise)
+#   Facing my postflop bets (chance: opp acts while owing chips to my first bet
+#   of the street)
 #     fold_to_bet, call_bet, raise_bet          overall
 #       + ":flop" / ":turn" / ":river"          by street
 #       + ":<0.25" / ":0.25-0.5" / ":0.5-0.8" / ":0.8-1.2" / ":>1.2"
 #                                               by my bet as a fraction of the pot
 #     (an all-in that only calls counts as a call; one that raises counts as a raise)
+#   Facing my postflop raises (I raised their bet or raise)
+#     fold_to_raise_post, call_raise_post, reraise_post   same suffixes as above
 #
 #   Their initiative (postflop)
 #     bet_vs_check[:street]      I checked, opp acts owing nothing -> did they bet
@@ -433,11 +436,17 @@ class OpponentTracker:
                             names = ["", ":" + street]
                             if my_last_bucket:
                                 names.append(":" + my_last_bucket)
-                            for k, stat in (("fold", "fold_to_bet"), ("call", "call_bet"),
-                                            ("raise", "raise_bet")):
+                            if raises <= 1:          # facing my bet
+                                stats = (("fold", "fold_to_bet"), ("call", "call_bet"),
+                                         ("raise", "raise_bet"))
+                                ftb_c += 1
+                                ftb_h += kind == "fold"
+                            else:                    # facing my raise over their bet
+                                stats = (("fold", "fold_to_raise_post"),
+                                         ("call", "call_raise_post"),
+                                         ("raise", "reraise_post"))
+                            for k, stat in stats:
                                 self._tally_all([stat + n for n in names], kind == k)
-                            ftb_c += 1
-                            ftb_h += kind == "fold"
                         if owed == 0:
                             if street_actions == 0:
                                 self._tally_all(["lead", "lead:" + street], is_aggr)
@@ -608,18 +617,18 @@ def decide(game_state: dict) -> dict:
     a JSON-serialisable "debug" value to what you return, e.g.
     {"action": "call", "debug": {"equity": 0.4}}. Run with: python3 play.py --show
     """
-    if game_state.get("type") == "warmup":     # one call before hand 1; load things here if you like
+    if game_state.get("type") == "warmup":     # one call before hand 1: warm the equity code
+        try:
+            equity(["As", "Kd"], ["2c", "7h", "9s"], 0.5, time_budget=0.05)
+        except Exception:
+            pass
         return {"action": "check"}
 
-    TRACKER.update(game_state)
-    read = read_opponent(game_state)
-
-    # ── Your strategy goes here: read["tag"] / read["adjust"] for switches,
-    #    read["fold_by_size"] etc. for EV maths. ──────────────────────────────
-    debug = {"read": read, "opp": TRACKER.summary()}
-    if game_state["can_check"]:
-        return {"action": "check", "debug": debug}
-    return {"action": "fold", "debug": debug}
+    try:
+        return _decide(game_state)
+    except Exception as ex:                     # never crash: safest legal action
+        return {"action": "check" if game_state.get("can_check") else "fold",
+                "debug": {"branch": "error", "error": repr(ex)[:300]}}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -648,7 +657,7 @@ def decide(game_state: dict) -> dict:
 #   shove_bot       preflop shove rate > 0.2                    call by equity vs shove range,
 #                                                               else fold; trap
 #   equity          no extreme label, and of their river bets   fold medium hands to their bets,
-#                   I called, <= 10% were weak (4+ samples)     attack checks, overbet value
+#                   I called, <= 10% were weak (8+ samples)     attack checks, overbet value
 #   passive_limper  button limp > 0.5, bets < 0.3 when it can   raise limps, bet when it checks,
 #                                                               fold to its bets
 #   balanced        fold rates near break-even at each size,    default game, probe sizes,
@@ -668,7 +677,8 @@ except ImportError:                       # always installed in the sandbox
 
 MIN_SAMPLE = 15          # chances before a stat counts toward a label
 SD_MIN = 5               # showdowns before the size/strength correlation is computed
-EQ_MIN_SAMPLES = 4      # called river bets seen before the equity test decides
+EQ_MIN_SAMPLES = 4      # called river bets seen before the test can say "balanced"
+EQ_TAG_SAMPLES = 8      # ... and before it can say "equity" (0 weak in 4 is too common)
 EQ_WEAK = 0.5           # a shown river bet below this equity counts as weak
 EQ_TAG_AT = 0.10        # weak rate at or below this -> "equity"
 EQ_BAL_AT = 0.20        # weak rate at or above this -> "balanced"; between: keep tag
@@ -877,14 +887,15 @@ def _pick_tag(scores):
 def _equity_test():
     """(tag, need_bluff_samples) for an opponent with no extreme label."""
     n, weak = TRACKER.shown_river_bets_called, TRACKER.weak_river_bets
+    need = n < EQ_TAG_SAMPLES            # keep calling some cheap river bets to learn
     if n < EQ_MIN_SAMPLES:
-        return "balanced", True          # call some cheap river bets to learn
+        return "balanced", need
     rate = weak / n
-    if rate <= EQ_TAG_AT:
+    if rate <= EQ_TAG_AT and n >= EQ_TAG_SAMPLES:
         _READ["equity_tag"] = "equity"
     elif rate >= EQ_BAL_AT:
         _READ["equity_tag"] = "balanced"
-    return _READ["equity_tag"], False
+    return _READ["equity_tag"], need
 
 
 def read_opponent(game_state: dict) -> dict:
@@ -1076,3 +1087,422 @@ def hand_strength(hole, board=(), opp_range=1.0, iters=1500):
         score += 1.0 if mine > theirs else 0.5 if mine == theirs else 0.0
         n += 1
     return score / n if n else 0.5
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Strategy, version 1: default ("balanced") play plus a few style flags.
+#
+#   eff_bb < 12        push_fold()
+#   preflop, deeper    preflop_chart()
+#   postflop           postflop_ev(): EV of each option from equity and the
+#                      opponent's fold rate per bet size
+#
+# Every branch returns (action dict, debug dict). Percentiles: 0 = best hand,
+# 1 = worst (preflop_rank).
+# ═════════════════════════════════════════════════════════════════════════════
+
+import time as _time
+
+DECISION_BUDGET = 0.6        # seconds of equity work per decision (limit is 2 s on 0.5 CPU)
+MAIN_EQ_BUDGET = 0.35        # first equity run
+RERUN_BUDGET = 0.1           # each narrowed e_call run
+POSTFLOP_SIZES = (0.33, 0.5, 0.75, 1.0, 1.5)
+PROBE_SIZES = (0.25, 0.4, 0.6)
+PROBE_HANDS = 30
+TIE_RANDOM = 0.05            # top two EVs within 5%: pick between them at random
+_PROBE = {"i": 0}            # rotates the probe size
+
+
+def _villains(my_cards, board, frac):
+    """Unblocked opponent combos from the top `frac` of starting hands (eval7 cards)."""
+    known = set(my_cards) | set(board)
+    top = max(1, round(min(max(float(frac), 1 / 1326), 1.0) * 1326))
+    return [ev for (x, y), ev in zip(_COMBOS[:top], _COMBOS_EV[:top])
+            if x not in known and y not in known]
+
+
+def _rank_on_board(villains, board):
+    """Same combos, strongest made hand on the current board first."""
+    bd = [_CARD[c] for c in board]
+    ev = eval7.evaluate
+    return sorted(villains, key=lambda v: ev([v[0], v[1]] + bd), reverse=True)
+
+
+def _top_share(ranked, share):
+    """The strongest `share` of a board-ranked range (at least one combo)."""
+    return ranked[:max(1, round(min(max(share, 0.0), 1.0) * len(ranked)))]
+
+
+def _equity_vs(my_cards, board, villains, time_budget=0.35, max_iters=2000):
+    """Equity vs an explicit list of opponent combos. Exact on the river."""
+    if not villains:
+        return 0.5
+    me = [_CARD[c] for c in my_cards]
+    bd = [_CARD[c] for c in board]
+    need = 5 - len(bd)
+    evaluate = eval7.evaluate
+    if need == 0:
+        mine = evaluate(me + bd)
+        score = 0.0
+        for v in villains:
+            theirs = evaluate([v[0], v[1]] + bd)
+            score += 1.0 if mine > theirs else 0.5 if mine == theirs else 0.0
+        return score / len(villains)
+    known = set(my_cards) | set(board)
+    deck = [c for s_, c in _CARD.items() if s_ not in known]
+    end = _time.perf_counter() + max(time_budget, 0.0)
+    choice, sample = random.choice, random.sample
+    score = 0.0
+    n = 0
+    for i in range(max_iters):
+        if i & 63 == 63 and _time.perf_counter() > end:
+            break
+        v = choice(villains)
+        run = [c for c in sample(deck, need + 2) if c != v[0] and c != v[1]][:need]
+        if len(run) < need:
+            continue
+        full = bd + run
+        mine = evaluate(me + full)
+        theirs = evaluate([v[0], v[1]] + full)
+        score += 1.0 if mine > theirs else 0.5 if mine == theirs else 0.0
+        n += 1
+    return score / n if n else 0.5
+
+
+def equity(my_cards, board, opp_range_frac, time_budget=0.35, max_iters=2000):
+    """Equity (wins + half ties) vs one opponent holding a hand in the top
+    `opp_range_frac` of starting hands. Samples straight from that range (same
+    result as rejection sampling, without the wasted draws). Exact on the river."""
+    return _equity_vs(my_cards, board, _villains(my_cards, board, opp_range_frac),
+                      time_budget, max_iters)
+
+
+def to_action(gs, total):
+    """Desired total bet for this street -> a legal action."""
+    my_max = gs["your_stack"] + gs["your_bet_this_street"]
+    total = int(total)
+    if total >= my_max or gs["min_raise_to"] > my_max:
+        if total <= gs["current_bet"] and gs["amount_owed"] > 0:
+            return {"action": "call"}             # can't raise: just call
+        return {"action": "all_in"}
+    if total <= gs["current_bet"]:
+        return {"action": "call"} if gs["amount_owed"] > 0 else {"action": "check"}
+    return {"action": "raise", "amount": max(total, gs["min_raise_to"])}
+
+
+def _passive(gs):
+    return {"action": "check"} if gs["amount_owed"] == 0 else {"action": "fold"}
+
+
+class _Clock:
+    """One time budget shared by every equity call in a decision."""
+    def __init__(self, gs):
+        limit = (gs.get("time_limit_ms") or 2000) / 1000
+        self.end = _time.perf_counter() + min(DECISION_BUDGET, 0.4 * limit)
+
+    def left(self):
+        return self.end - _time.perf_counter()
+
+    def take(self, want):
+        return max(0.0, min(want, self.left()))
+
+
+def _bb(gs):
+    return (gs.get("blinds") or {}).get("bb") or 100
+
+
+def _eff_bb(gs):
+    me = gs.get("your_bot_id")
+    mine = gs["your_stack"] + gs["your_bet_this_street"]
+    theirs = [p.get("stack", 0) + p.get("bet_this_street", 0) for p in gs.get("players") or []
+              if p.get("bot_id") != me and p.get("state") != "busted"]
+    return min([mine] + theirs) / _bb(gs)
+
+
+def _preflop_raises(gs):
+    """Voluntary raises so far this hand preflop (blinds excluded)."""
+    cur, n = 0, 0
+    for e in gs.get("action_log") or []:
+        if e.get("street") != "preflop":
+            continue
+        a, amt = e.get("action"), e.get("amount") or 0
+        if a in ("small_blind", "big_blind"):
+            cur = max(cur, amt)
+        elif a in ("raise", "all_in") and amt > cur:
+            cur, n = amt, n + 1
+    return n
+
+
+def _opp_all_in(gs):
+    me = gs.get("your_bot_id")
+    return any(p.get("bot_id") != me and (p.get("is_all_in") or p.get("state") == "all_in")
+               for p in gs.get("players") or [])
+
+
+def _decide(gs):
+    t0 = _time.perf_counter()
+    TRACKER.update(gs)
+    read = read_opponent(gs)
+    tag, style = read["tag"], read["adjust"]
+    clock = _Clock(gs)
+    eff = _eff_bb(gs)
+
+    if eff < 12:
+        branch = "push_fold"
+        act, dbg = push_fold(gs, tag, style, eff, clock)
+    elif gs["street"] == "preflop":
+        branch = "preflop_chart"
+        act, dbg = preflop_chart(gs, tag, style)
+    else:
+        branch = "postflop_ev"
+        act, dbg = postflop_ev(gs, tag, style, clock)
+
+    # legality guard: never check when owing, never fold when checking is free
+    if act["action"] == "check" and gs["amount_owed"] > 0:
+        act = {"action": "fold"}
+    if act["action"] == "fold" and gs["can_check"]:
+        act = {"action": "check"}
+
+    dbg.update({"tag": tag, "branch": branch, "eff_bb": round(eff, 1), "action": act,
+                "ms": round((_time.perf_counter() - t0) * 1000, 1)})
+    act = dict(act)
+    act["debug"] = dbg
+    return act
+
+
+# ── push / fold (eff_bb < 12) ────────────────────────────────────────────────
+def push_fold(gs, tag, style, eff, clock):
+    pct = preflop_rank(gs["your_cards"])
+    dbg = {"pct": round(pct, 3)}
+    if gs["street"] != "preflop":
+        # short postflop: shove any decent equity, otherwise check/fold
+        e = equity(gs["your_cards"], gs["community_cards"], 0.6, clock.take(MAIN_EQ_BUDGET))
+        dbg["equity"] = round(e, 3)
+        owed, pot = gs["amount_owed"], gs["pot"]
+        if owed and e > owed / (pot + owed):
+            return to_action(gs, 10 ** 9), dbg
+        if not owed and e > 0.55:
+            return to_action(gs, 10 ** 9), dbg
+        return _passive(gs), dbg
+
+    facing_raise = gs["current_bet"] > _bb(gs)
+    if not facing_raise:
+        x = min(0.35 + (12 - eff) * 0.04, 0.8)
+        if tag == "folder":
+            x += 0.1
+        elif tag == "station":
+            x -= 0.1
+        dbg["shove_top"] = round(x, 3)
+        if pct <= x:
+            return {"action": "all_in"}, dbg
+        return _passive(gs), dbg
+
+    their_range = 0.6 if tag == "shove_bot" else 0.4
+    e = equity(gs["your_cards"], [], their_range, clock.take(MAIN_EQ_BUDGET))
+    owed, pot = gs["amount_owed"], gs["pot"]
+    need = owed / (pot + owed)
+    dbg.update({"equity": round(e, 3), "need": round(need, 3), "their_range": their_range})
+    if e > need:
+        # vs an all-in: call. vs a smaller raise at this depth: re-shove instead of
+        # calling and leaving a few BB behind.
+        return ({"action": "call"} if _opp_all_in(gs) else {"action": "all_in"}), dbg
+    return _passive(gs), dbg
+
+
+# ── preflop chart (eff_bb >= 12) ─────────────────────────────────────────────
+def preflop_chart(gs, tag, style):
+    pct = preflop_rank(gs["your_cards"])
+    bb = _bb(gs)
+    raises = _preflop_raises(gs)
+    i_am_bb = gs.get("bb_seat") == gs.get("seat_to_act")
+    dbg = {"pct": round(pct, 3), "raises": raises}
+
+    if raises == 0 and not i_am_bb:                       # button, unopened
+        top = 0.8 if style.get("steal") == "wide" else 0.7
+        dbg["spot"] = "open"
+        if pct <= top:
+            return to_action(gs, style.get("open_size_bb", 2.5) * bb), dbg
+        return _passive(gs), dbg
+
+    if raises == 0:                                       # BB facing a limp
+        dbg["spot"] = "vs_limp"
+        if pct <= 0.30:
+            return to_action(gs, 3.5 * bb), dbg
+        return {"action": "check"}, dbg
+
+    if raises == 1:                                       # facing a raise
+        dbg["spot"] = "vs_raise"
+        if pct <= 0.12:
+            return to_action(gs, 3 * gs["current_bet"]), dbg
+        if pct <= 0.55:
+            return {"action": "call"}, dbg
+        return _passive(gs), dbg
+
+    dbg["spot"] = "vs_reraise"                            # facing a re-raise
+    if pct <= 0.05:
+        total = 2.5 * gs["current_bet"]
+        my_max = gs["your_stack"] + gs["your_bet_this_street"]
+        if total > 0.4 * my_max:                          # committing anyway: shove
+            total = my_max
+        return to_action(gs, total), dbg
+    if pct <= 0.20:
+        return {"action": "call"}, dbg
+    return _passive(gs), dbg
+
+
+# ── postflop EV ──────────────────────────────────────────────────────────────
+RAISE_FOLD_PRIOR = 0.15      # fold rate assumed for my raises until real samples exist
+RAISE_FOLD_MIN = 5           # samples needed before the tracker's fold-to-raise is used
+STACK_OFF_SHARE = 1 / 3      # actions putting in more than this share of my stack...
+STACK_OFF_EQ = 0.55          # ...need this equity vs the narrowed range, or a strong hand
+RERAISE_EQ = 0.6             # equity needed to re-raise a re-raise
+SAMPLE_CALL_MIN_EFF = 25     # sample-collection river calls only above this depth
+
+
+def _pick(evs):
+    """Highest EV; if the top two are within TIE_RANDOM of each other, pick at random."""
+    ranked = sorted(evs.items(), key=lambda kv: kv[1], reverse=True)
+    if len(ranked) > 1:
+        (k1, v1), (k2, v2) = ranked[0], ranked[1]
+        if abs(v1 - v2) <= TIE_RANDOM * max(abs(v1), abs(v2)):
+            return random.choice((k1, k2))
+    return ranked[0][0]
+
+
+def _street_aggression(gs):
+    """(opponent's bets/raises, everyone's bets/raises) on the current street."""
+    me, street = gs.get("your_bot_id"), gs["street"]
+    cur = opp_n = all_n = 0
+    for e in gs.get("action_log") or []:
+        if e.get("street") != street:
+            continue
+        a, amt = e.get("action"), e.get("amount") or 0
+        if a in ("raise", "all_in") and amt > cur:
+            cur = amt
+            all_n += 1
+            opp_n += e.get("bot_id") != me
+    return opp_n, all_n
+
+
+def _raise_fold_rate(bucket):
+    """Fold rate to my postflop raises: the bucket's rate, else the overall rate,
+    once RAISE_FOLD_MIN samples exist; RAISE_FOLD_PRIOR before that."""
+    for name in ("fold_to_raise_post:" + bucket, "fold_to_raise_post"):
+        if TRACKER.count(name)[1] >= RAISE_FOLD_MIN:
+            return TRACKER.get(name, RAISE_FOLD_PRIOR, 5)
+    return RAISE_FOLD_PRIOR
+
+
+def _strong_made(hole, board):
+    """At least two pair made with my cards, or top pair with a T+ kicker, or an overpair."""
+    cat = HAND_TYPES.index(made_hand(hole, board))
+    ranks = [_RANKS.index(c[0]) for c in board]
+    counts = sorted((ranks.count(r) for r in set(ranks)), reverse=True)
+    board_cat = {4: 7, 3: 6 if len(counts) > 1 and counts[1] >= 2 else 3}.get(
+        counts[0], 2 if counts[:2] == [2, 2] else 1 if counts[0] == 2 else 0)
+    mine = [_RANKS.index(c[0]) for c in hole]
+    top = max(ranks)
+    if cat >= 2 and cat > board_cat:
+        # on a paired board, two pair only counts if my pair is top pair or better
+        if cat == 2 and board_cat == 1:
+            return any(r == top for r in mine) or (mine[0] == mine[1] and mine[0] > top)
+        return True
+    if cat == 1 and board_cat == 0:
+        if mine[0] == mine[1]:
+            return mine[0] > top                          # overpair
+        if top in mine:
+            kicker = mine[1] if mine[0] == top else mine[0]
+            return kicker >= _RANKS.index("T")            # top pair, good kicker
+    return False
+
+
+def postflop_ev(gs, tag, style, clock):
+    hole, board = gs["your_cards"], gs["community_cards"]
+    pot, owed = gs["pot"], gs["amount_owed"]
+    my_stack = gs["your_stack"]
+    opp_range = min(max(TRACKER.get("vpip", 0.65, 10), 0.3), 0.9)
+    base = _villains(hole, board, opp_range)
+    ranked = _rank_on_board(base, board)                  # strongest on this board first
+    e = _equity_vs(hole, board, base, clock.take(MAIN_EQ_BUDGET))
+    dbg = {"equity": round(e, 3), "opp_range": round(opp_range, 3)}
+    probe = gs.get("hand_num", 0) < PROBE_HANDS
+
+    def eq_vs(villains, fallback):
+        if clock.left() < RERUN_BUDGET:
+            return fallback, False
+        return _equity_vs(hole, board, villains, clock.take(RERUN_BUDGET)), True
+
+    evs, actions, guard_eq, chips_in = {}, {}, {}, {}
+    e_bet = None
+    if owed == 0:
+        i_am_bb = gs.get("bb_seat") == gs.get("seat_to_act")
+        r = 0.9 if i_am_bb else 1.0                        # out of position realises less
+        evs["check"], actions["check"], chips_in["check"] = e * pot * r, {"action": "check"}, 0
+        sizes = (PROBE_SIZES[_PROBE["i"] % len(PROBE_SIZES)],) if probe else POSTFLOP_SIZES
+        reran = 0
+        for b in sizes:
+            bet = max(int(b * pot), 1)
+            f = TRACKER.get("fold_to_bet:" + _frac_bucket(b), 0.4, 10)
+            ec, ok = eq_vs(_top_share(ranked, 1 - f), e * 0.85)   # vs the hands that call
+            reran += ok
+            act = to_action(gs, bet)
+            if act["action"] == "all_in":
+                bet = my_stack + gs["your_bet_this_street"]
+            key = f"bet_{b}"
+            evs[key] = f * pot + (1 - f) * (ec * (pot + 2 * bet) - bet)
+            actions[key], guard_eq[key] = act, ec
+            chips_in[key] = bet - gs["your_bet_this_street"]
+        dbg["reran"] = reran
+    else:
+        opp_aggr, street_raises = _street_aggression(gs)
+        factor = 0.3 if style.get("respect_bets") else 0.8 if tag == "maniac" else 0.5
+        keep = factor ** max(opp_aggr, 1)                  # narrow again for each raise
+        bet_range = _top_share(ranked, keep)
+        e_bet = _equity_vs(hole, board, bet_range, clock.take(RERUN_BUDGET))
+        dbg.update({"e_bet": round(e_bet, 3), "keep": round(keep, 3), "opp_aggr": opp_aggr,
+                    "street_raises": street_raises})
+        evs["fold"], actions["fold"], chips_in["fold"] = 0.0, {"action": "fold"}, 0
+        evs["call"], actions["call"] = e_bet * (pot + owed) - owed, {"action": "call"}
+        guard_eq["call"], chips_in["call"] = e_bet, min(owed, my_stack)
+
+        total = 3 * gs["current_bet"]
+        my_max = my_stack + gs["your_bet_this_street"]
+        reraise_ok = street_raises < 2 or e_bet > RERAISE_EQ
+        dbg["reraise_ok"] = reraise_ok
+        if gs["min_raise_to"] <= my_max and reraise_ok:
+            total = min(max(total, gs["min_raise_to"]), my_max)
+            added = total - gs["your_bet_this_street"]
+            raise_frac = (total - gs["current_bet"]) / max(pot + owed, 1)
+            f_r = _raise_fold_rate(_frac_bucket(raise_frac))
+            ec, _ = eq_vs(_top_share(bet_range, 1 - f_r), e_bet * 0.85)
+            final_pot = pot + added + (total - gs["current_bet"])
+            evs["raise_3x"] = f_r * pot + (1 - f_r) * (ec * final_pot - added)
+            actions["raise_3x"], guard_eq["raise_3x"] = to_action(gs, total), ec
+            chips_in["raise_3x"] = added
+            dbg["f_raise"] = round(f_r, 3)
+
+    choice = _pick(evs)
+    act = actions[choice]
+
+    # stack-off guard: big commitments need real strength
+    if chips_in.get(choice, 0) > STACK_OFF_SHARE * my_stack:
+        strong = _strong_made(hole, board)
+        geq = guard_eq.get(choice, e)
+        dbg["guard"] = {"chips": chips_in[choice], "eq": round(geq, 3), "strong": strong}
+        if not (geq > STACK_OFF_EQ or strong):
+            if owed and e_bet is not None and e_bet > owed / (pot + owed):
+                act, choice = {"action": "call"}, choice + "->guard_call"
+            else:
+                act, choice = _passive(gs), choice + "->guard_" + _passive(gs)["action"]
+
+    # sample collection for the equity-bot test: call small river bets when deep
+    if (owed > 0 and act["action"] == "fold" and style.get("need_bluff_samples")
+            and gs["street"] == "river" and owed <= 0.5 * (pot - owed)
+            and _eff_bb(gs) > SAMPLE_CALL_MIN_EFF):
+        act, choice = {"action": "call"}, "call_for_sample"
+
+    if probe and act["action"] in ("raise", "all_in") and owed == 0:
+        _PROBE["i"] += 1
+    dbg["ev"] = {k: round(v, 1) for k, v in evs.items()}
+    dbg["choice"] = choice
+    return act, dbg
